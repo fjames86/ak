@@ -4,7 +4,15 @@ AK protocol implementation. Mainly used for simulators but has a simple client a
 
 ## 1. Introduction
 
-AK protocol used for communicating with certain types of devices.
+AK protocol used for communicating with certain types of devices. It is a very simple text
+based protocol consisting of a fixed sized header followed by variable length data, framed with
+the STX and ETX characters. 
+
+Request format: `<ETX> XXXX Knn ...<ETX>`
+Reply format: `<ETX> XXXX e ...<ETX>`
+Where `XXXX` is a 4-character function code e.g. `ASTZ` (request status), `nn` is a channel number
+typically `0`, `e` is a response status byte and `...` represents variable length request/response
+data.
 
 ## 2. Usage
 
@@ -14,7 +22,10 @@ Use the `CALL` method, passing a 4-character keyword command name and an integer
 plus any number of command arguments.
 
 ```
+(CONNECT 8000 #(127 0 0 1))
 (CALL :ASTZ 0)
+(CALL :AKON 0)
+(DISCONNECT)
 ```
 
 ## 2.2 Server

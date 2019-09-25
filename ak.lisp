@@ -6,6 +6,7 @@
   (:export #:connect
 	   #:disconnect
 	   #:call
+	   #:device-base
 	   #:device
 	   #:device-status
 	   #:device-mode
@@ -14,11 +15,20 @@
 	   #:defcommand
 	   #:start-device
 	   #:stop-device
-	   #:ak-error))
-	   
+	   #:*log-stream*
+	   #:ak-error))	   
 	  
 (in-package #:ak)
 
+;; -------------- debug logging ---------------
+(defvar *log-stream* nil) ;; *error-output*)
+(defun format-log (fmt &rest args)
+  (when *log-stream*
+    (multiple-value-bind (s m h) (decode-universal-time (get-universal-time))
+      (format *log-stream* "~A:~A:~A " h m s))
+    (apply #'format *log-stream* fmt args)
+    (format *log-stream* "~%")))
+;; --------------------------------------------
 
 ;; AK protocol is asymmetric. AK host works as a server that answers to clients. It accepts command telegrams and answers with acknowledge telegrams. For each command telegram AK host answers with exactly one acknowledge telegram. It does not send anything to the client without a request. AK telegrams have the following format:
 
@@ -87,7 +97,9 @@
        (done nil))
       (done offset)
     (let ((n (fsocket:socket-recv fd buf :start offset)))
-      (when (= n 0) (error "Graceful close"))
+      (when (= n 0)
+	(format-log "Graceful close")
+	(return-from read-command 0))
       (dotimes (i n)
 	(when (= (aref buf (+ start i)) (char-code #\etx))
 	  (setf done t)))
@@ -162,6 +174,11 @@
   (:report (lambda (c stream) (format stream "AK Error Status ~A" (ak-error-code c)))))
 
 (defun call (fncode channel &rest args)
+  "Send a request command and await a response. 
+FNCODE ::= 4-character keyword command name.
+CHANNEL ::= integer channel number.
+ARGS ::= arguments to send.
+Returns (values response-data)." 
   (unless *conn* (error "Not connected"))
   (let ((cmd (babel:string-to-octets (apply #'command-string fncode channel args))))
     (send-all *conn* cmd))
@@ -174,20 +191,22 @@
 
 ;; ---------- server -------------
 
-(defclass device ()
+(defclass device-base ()
   ((port :initform 0 :initarg :port :accessor device-port)
    (thread :initform nil :accessor device-thread)
    (stop :initform nil :accessor device-stop)
-   (raddr :initform nil :accessor device-raddr)
-   (mode :initform :sman :accessor device-mode)
-   (status :initform :stby :accessor device-status)
-   (version :initform "1.0.0" :initarg :version :accessor device-version)
-   (alarm :initform 0 :accessor device-alarm)))
-(defmethod print-object ((d device) stream)
+   (raddr :initform nil :accessor device-raddr)))
+(defmethod print-object ((d device-base) stream)
   (print-unreadable-object (d stream :type t)
     (format stream ":PORT ~D :RUNNING ~A :RADDR ~A" (device-port d) (not (null (device-thread d)))
 	    (when (device-raddr d)
 	      (fsocket:sockaddr-string (device-raddr d))))))
+
+(defclass device (device-base)
+  ((mode :initform :sman :accessor device-mode)
+   (status :initform :stby :accessor device-status)
+   (version :initform "1.0.0" :initarg :version :accessor device-version)
+   (alarm :initform 0 :accessor device-alarm)))
 
 (defgeneric process-command (device fncode channel args))
 
@@ -230,18 +249,20 @@ Return a list of reply data or signal an AK-ERROR condition.
 
 (defun handle-command (buf offset device)
   (multiple-value-bind (fncode channel args end) (parse-command buf offset)
-    #+nil(format t "-> ~A ~A ~A~%" fncode channel args)
+    (format-log "~A -> ~A ~A ~A" (type-of device) fncode channel args)
     (let ((rstr (handler-case
 		    (let ((rdata (process-command device (intern fncode :keyword) channel args)))
 		      (apply #'reply-string fncode 0 (if (listp rdata) rdata (list rdata))))
 		  (ak-error (e)
-		    (format t "AK-ERROR: FNCODE=~A STATUS=~A~%" fncode (ak-error-code e))
+		    (format-log "~A AK-ERROR: FNCODE=~A STATUS=~A" (type-of device) fncode (ak-error-code e))
 		    (reply-string fncode (ak-error-code e)))
 		  (error (e)
-		    (format t "ERROR: FNCODE=~A ~S~%" fncode e)
+		    (format-log "~A ERROR: FNCODE=~A ~S" (type-of device) fncode e)
 		    (reply-string "????" 0)))))
-      #+nil(format t "<- ~A~%" rstr)
-      (values (babel:string-to-octets rstr) end))))
+      (format-log "~A <- ~A" (type-of device) rstr)
+      (values (when rstr
+		(babel:string-to-octets rstr))
+	      end))))
 
 ;; ------------- networking ----------------
 
@@ -253,7 +274,8 @@ Return a list of reply data or signal an AK-ERROR condition.
       (let ((n (read-command fd buf offset)))
 	(when (= n 0) (return-from process-connection))
 	(multiple-value-bind (rbuf end) (handle-command buf offset device)
-	  (send-all fd rbuf)
+	  (when rbuf 
+	    (send-all fd rbuf))
 	  (dotimes (i (- end n))
 	    (setf (aref buf i) (aref buf (+ end i))
 		  offset (- end n)))))))
@@ -265,17 +287,18 @@ Return a list of reply data or signal an AK-ERROR condition.
     (while (not (device-stop device))
       (multiple-value-bind (cfd raddr) (fsocket:socket-accept fd)
 	(setf (device-raddr device) raddr)
-	#+nil(format t "ACCEPT~%")
+	(format-log "~A ACCEPT ~S" (type-of device) raddr)
 	(handler-case (process-connection cfd device)
 	  (error (e)
-	    (format t "ERROR: ~A~%" e)
+	    (format-log "~A ERROR: ~A" (type-of device) e)
 	    nil))
-	#+nil(format t "CLOSE~%")
+	(format-log "~A CLOSE" (type-of device))
 	(fsocket:close-socket cfd)
 	(setf (device-raddr device) nil))))
   (setf (device-thread device) nil))
 
 (defun start-device (device)
+  "Start a device server running." 
   (setf (device-stop device) nil
 	(device-thread device)
 	(bt:make-thread (lambda () (run-device-server device))
@@ -283,6 +306,7 @@ Return a list of reply data or signal an AK-ERROR condition.
   device)
  
 (defun stop-device (device)
+  "Stop a device server and wait for its thread to terminate." 
   (setf (device-stop device) t)
   (ignore-errors
     (connect (device-port device))
