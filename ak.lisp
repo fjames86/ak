@@ -207,6 +207,14 @@ Returns (values response-data)."
    (status :initform :stby :accessor device-status)
    (version :initform "1.0.0" :initarg :version :accessor device-version)
    (alarm :initform 0 :accessor device-alarm)))
+(defmethod print-object ((d device) stream)
+  (print-unreadable-object (d stream :type t)
+    (format stream ":PORT ~D :RUNNING ~A :RADDR ~A :STATUS ~A"
+	    (device-port d)
+	    (not (null (device-thread d)))
+	    (when (device-raddr d)
+	      (fsocket:sockaddr-string (device-raddr d)))
+	    (device-status d))))
 
 (defgeneric process-command (device fncode channel args))
 
